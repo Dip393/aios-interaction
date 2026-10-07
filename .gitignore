@@ -1,0 +1,12 @@
+node_modules/
+.next/
+out/
+.env
+.env.local
+.venv/
+__pycache__/
+*.pyc
+apps/api/data/*.db
+src-tauri/target/
+apps/web/.env.local
+.DS_Store

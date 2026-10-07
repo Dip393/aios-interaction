@@ -1,0 +1,22 @@
+{
+  "name": "aios-runtime",
+  "private": true,
+  "version": "0.2.0",
+  "description": "AIOS Runtime - Intent-driven AI operating environment",
+  "scripts": {
+    "dev": "concurrently \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "npm --prefix apps/web run dev",
+    "dev:api": "python scripts/run_api.py",
+    "build": "npm --prefix apps/web run build",
+    "check": "npm --prefix apps/web run typecheck",
+    "desktop:dev": "npm --prefix apps/web run build && cargo tauri dev",
+    "desktop:build": "npm --prefix apps/web run build && cargo tauri build",
+    "web:build": "npm --prefix apps/web run build",
+    "web:typecheck": "npm --prefix apps/web run typecheck",
+    "api": "python scripts/run_api.py"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.1",
+    "concurrently": "^9.2.1"
+  }
+}
