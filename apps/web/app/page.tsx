@@ -201,9 +201,7 @@ export default function Home() {
         },
       );
 
-      if (
-        restored?.success === false
-      ) {
+      if (restored?.success === false) {
         setNotice(
           restored?.message ||
             'Rollback failed.',
@@ -356,10 +354,28 @@ export default function Home() {
           AI<span>OS</span> RUNTIME
         </div>
 
-        <div className="status">
-          <span className="dot" />
-          Local-first ·{' '}
-          {busy ? 'thinking…' : 'ready'}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+          }}
+        >
+          <button
+            type="button"
+            className="primary"
+            onClick={() => {
+              window.location.href = '/ai';
+            }}
+          >
+            Open AI
+          </button>
+
+          <div className="status">
+            <span className="dot" />
+            Local-first ·{' '}
+            {busy ? 'thinking…' : 'ready'}
+          </div>
         </div>
       </header>
 

@@ -32,7 +32,37 @@ type ScreenSize = {
   height: number;
 };
 
+type ScreenPoint = {
+  x: number;
+  y: number;
+};
+
 const CLICK_COOLDOWN_MS = 500;
+
+/* A gesture must persist this many frames before it triggers anything. */
+const STABLE_FRAMES = 3;
+const PINCH_STABLE_FRAMES = 2;
+
+/* Hold an open palm this long to pause / resume control. */
+const PALM_HOLD_MS = 800;
+
+/* Ignore native moves smaller than this (pixels). */
+const MIN_MOVE_PX = 2;
+
+/*
+ * Cursor stops following the finger while thumb and index approach
+ * each other, so the click lands where the user was pointing.
+ */
+const PINCH_FREEZE_DISTANCE = 0.6;
+
+/*
+ * Only the central part of the camera frame is mapped to the screen,
+ * so the screen edges are reachable without leaving the frame.
+ */
+const ACTIVE_X_MIN = 0.12;
+const ACTIVE_X_MAX = 0.88;
+const ACTIVE_Y_MIN = 0.1;
+const ACTIVE_Y_MAX = 0.8;
 
 function clamp(
   value: number,
@@ -40,6 +70,14 @@ function clamp(
   max: number,
 ): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function mapRange(
+  value: number,
+  min: number,
+  max: number,
+): number {
+  return clamp((value - min) / (max - min), 0, 1);
 }
 
 export default function VisionPanel({
@@ -58,29 +96,65 @@ export default function VisionPanel({
   const startingRef =
     useRef(false);
 
+  const wantCameraRef =
+    useRef(false);
+
   const cameraGenerationRef =
-    useRef(0);
-
-  const lastGestureRef =
-    useRef("NONE");
-
-  const lastClickTimeRef =
     useRef(0);
 
   const tauriAvailableRef =
     useRef(false);
 
+  /* Control state mirrored in refs so the per-frame handler is stable. */
+  const controlEnabledRef =
+    useRef(false);
+
+  const pausedRef =
+    useRef(false);
+
+  /* Gesture stabilisation. */
+  const candidateGestureRef =
+    useRef("NONE");
+
+  const candidateCountRef =
+    useRef(0);
+
+  const stableGestureRef =
+    useRef("NONE");
+
+  const palmStartRef =
+    useRef<number | null>(null);
+
+  const palmLatchedRef =
+    useRef(false);
+
+  const lastClickTimeRef =
+    useRef(0);
+
+  /* Native mouse plumbing. */
   const screenSizeRef =
     useRef<ScreenSize | null>(null);
+
+  const screenSizePromiseRef =
+    useRef<Promise<ScreenSize | null> | null>(null);
+
+  const pendingMoveRef =
+    useRef<ScreenPoint | null>(null);
+
+  const lastSentRef =
+    useRef<ScreenPoint | null>(null);
+
+  const mouseMoveInFlightRef =
+    useRef(false);
+
+  const lastStatusRef =
+    useRef("");
 
   const frameCountRef =
     useRef(0);
 
   const fpsStartRef =
     useRef<number | null>(null);
-
-  const mouseMoveInFlightRef =
-    useRef(false);
 
   const [cameraActive, setCameraActive] =
     useState(false);
@@ -92,6 +166,9 @@ export default function VisionPanel({
     useState<string | null>(null);
 
   const [controlEnabled, setControlEnabled] =
+    useState(false);
+
+  const [paused, setPaused] =
     useState(false);
 
   const [gesture, setGesture] =
@@ -122,6 +199,25 @@ export default function VisionPanel({
     useState(false);
 
   /*
+   * Status text. Only touches React state when the text changes,
+   * so it is safe to call on every frame.
+   */
+  const setStatus = useCallback(
+    (message: string) => {
+      if (lastStatusRef.current === message) {
+        return;
+      }
+
+      lastStatusRef.current = message;
+
+      if (mountedRef.current) {
+        setMouseStatus(message);
+      }
+    },
+    [],
+  );
+
+  /*
    * Detect whether we are running
    * inside the Tauri desktop runtime.
    */
@@ -137,7 +233,7 @@ export default function VisionPanel({
     setTauriAvailable(available);
 
     if (!available) {
-      setMouseStatus(
+      setStatus(
         "Browser mode — native mouse control unavailable",
       );
     }
@@ -145,12 +241,97 @@ export default function VisionPanel({
     return () => {
       mountedRef.current = false;
     };
+  }, [setStatus]);
+
+  /*
+   * Reset everything that tracks gestures / pending mouse work.
+   */
+  const resetGestureState = useCallback(() => {
+    candidateGestureRef.current = "NONE";
+    candidateCountRef.current = 0;
+    stableGestureRef.current = "NONE";
+
+    palmStartRef.current = null;
+    palmLatchedRef.current = false;
+
+    lastClickTimeRef.current = 0;
+
+    pendingMoveRef.current = null;
+    lastSentRef.current = null;
   }, []);
+
+  /*
+   * Stop camera.
+   */
+  const stopCamera = useCallback(() => {
+    wantCameraRef.current = false;
+
+    cameraGenerationRef.current += 1;
+
+    const stream = streamRef.current;
+
+    streamRef.current = null;
+
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch {
+        // Ignore cleanup errors.
+      }
+
+      videoRef.current.srcObject = null;
+    }
+
+    if (stream) {
+      stream
+        .getTracks()
+        .forEach((track) => {
+          try {
+            track.stop();
+          } catch {
+            // Ignore already stopped tracks.
+          }
+        });
+    }
+
+    setCameraActive(false);
+    setCameraLoading(false);
+
+    setGesture("NONE");
+    setGestureConfidence(0);
+    setCursor(null);
+    setHands(0);
+    setProcessing(false);
+    setFps(0);
+
+    frameCountRef.current = 0;
+    fpsStartRef.current = null;
+
+    resetGestureState();
+
+    screenSizeRef.current = null;
+    screenSizePromiseRef.current = null;
+
+    controlEnabledRef.current = false;
+    pausedRef.current = false;
+
+    setControlEnabled(false);
+    setPaused(false);
+
+    setStatus("Hands-free control disabled");
+  }, [resetGestureState, setStatus]);
 
   /*
    * Start camera.
    */
   const startCamera = useCallback(async () => {
+    wantCameraRef.current = true;
+
+    /*
+     * If a start is already in flight (React Strict Mode double
+     * effect, quick double click) the in-flight call re-checks
+     * `wantCameraRef` in `finally` and restarts if needed.
+     */
     if (startingRef.current) {
       return;
     }
@@ -209,6 +390,27 @@ export default function VisionPanel({
       }
 
       streamRef.current = stream;
+
+      /*
+       * Camera unplugged / taken away by the OS:
+       * reflect it in the UI instead of silently freezing.
+       */
+      stream.getVideoTracks().forEach((track) => {
+        track.addEventListener("ended", () => {
+          if (
+            streamRef.current !== stream ||
+            !mountedRef.current
+          ) {
+            return;
+          }
+
+          stopCamera();
+
+          setCameraError(
+            "Camera disconnected. Press Retry Camera.",
+          );
+        });
+      });
 
       const video = videoRef.current;
 
@@ -307,63 +509,21 @@ export default function VisionPanel({
       if (mountedRef.current) {
         setCameraLoading(false);
       }
-    }
-  }, []);
 
-  /*
-   * Stop camera.
-   */
-  const stopCamera = useCallback(() => {
-    cameraGenerationRef.current += 1;
-
-    const stream = streamRef.current;
-
-    streamRef.current = null;
-
-    if (videoRef.current) {
-      try {
-        videoRef.current.pause();
-      } catch {
-        // Ignore cleanup errors.
+      /*
+       * A start was requested while this one was being superseded
+       * (Strict Mode mount -> cleanup -> mount). Start again.
+       */
+      if (
+        wantCameraRef.current &&
+        mountedRef.current &&
+        !streamRef.current &&
+        generation !== cameraGenerationRef.current
+      ) {
+        void startCamera();
       }
-
-      videoRef.current.srcObject = null;
     }
-
-    if (stream) {
-      stream
-        .getTracks()
-        .forEach((track) => {
-          try {
-            track.stop();
-          } catch {
-            // Ignore already stopped tracks.
-          }
-        });
-    }
-
-    setCameraActive(false);
-    setCameraLoading(false);
-
-    setGesture("NONE");
-    setGestureConfidence(0);
-    setCursor(null);
-    setHands(0);
-    setProcessing(false);
-    setFps(0);
-
-    lastGestureRef.current = "NONE";
-    lastClickTimeRef.current = 0;
-
-    screenSizeRef.current = null;
-    mouseMoveInFlightRef.current = false;
-
-    setControlEnabled(false);
-
-    setMouseStatus(
-      "Hands-free control disabled",
-    );
-  }, []);
+  }, [stopCamera]);
 
   /*
    * Automatically start camera.
@@ -420,118 +580,160 @@ export default function VisionPanel({
   }, []);
 
   /*
-   * Get screen dimensions only once
-   * and cache them.
+   * Screen size: fetched ONCE (single shared promise) when control is
+   * enabled, then read synchronously from `screenSizeRef` on every
+   * frame. A failure is cached too, so there is never a retry per frame.
    */
   const getScreenSize =
-    useCallback(async (): Promise<ScreenSize | null> => {
+    useCallback((): Promise<ScreenSize | null> => {
       if (!tauriAvailableRef.current) {
-        return null;
+        return Promise.resolve(null);
       }
 
-      if (screenSizeRef.current) {
-        return screenSizeRef.current;
+      if (!screenSizePromiseRef.current) {
+        screenSizePromiseRef.current = (async () => {
+          try {
+            const screen =
+              await invoke<ScreenSize>(
+                "vision_mouse_screen_size",
+              );
+
+            if (
+              screen &&
+              screen.width > 0 &&
+              screen.height > 0
+            ) {
+              screenSizeRef.current = screen;
+
+              return screen;
+            }
+          } catch (error) {
+            console.warn(
+              "Native screen size unavailable, using window.screen:",
+              error,
+            );
+          }
+
+          /*
+           * Fallback (e.g. non-Windows builds): derive from the webview.
+           */
+          const scale = /win/i.test(navigator.platform)
+            ? window.devicePixelRatio || 1
+            : 1;
+
+          const fallback = {
+            width: Math.round(window.screen.width * scale),
+            height: Math.round(window.screen.height * scale),
+          };
+
+          if (fallback.width > 0 && fallback.height > 0) {
+            screenSizeRef.current = fallback;
+
+            return fallback;
+          }
+
+          return null;
+        })();
       }
 
-      try {
-        const screen =
-          await invoke<ScreenSize>(
-            "vision_mouse_screen_size",
-          );
-
-        if (
-          screen &&
-          screen.width > 0 &&
-          screen.height > 0
-        ) {
-          screenSizeRef.current = screen;
-
-          return screen;
-        }
-
-        return null;
-      } catch (error) {
-        console.error(
-          "Failed to get screen size:",
-          error,
-        );
-
-        return null;
-      }
+      return screenSizePromiseRef.current;
     }, []);
 
   /*
-   * Move native OS mouse.
-   *
-   * We deliberately avoid sending multiple
-   * move requests simultaneously.
+   * Sends queued mouse moves, one invoke at a time.
+   * While an invoke is in flight only the NEWEST target is kept,
+   * so the cursor never lags behind a backlog.
    */
-  const moveNativeMouse =
-    useCallback(
-      async (
-        position: {
-          x: number;
-          y: number;
-        },
-      ) => {
-        if (
-          !tauriAvailableRef.current ||
-          mouseMoveInFlightRef.current
+  const flushMouseMove =
+    useCallback(async () => {
+      if (mouseMoveInFlightRef.current) {
+        return;
+      }
+
+      mouseMoveInFlightRef.current = true;
+
+      try {
+        while (
+          pendingMoveRef.current &&
+          mountedRef.current
         ) {
-          return;
-        }
+          const target = pendingMoveRef.current;
 
-        mouseMoveInFlightRef.current = true;
+          pendingMoveRef.current = null;
 
-        try {
-          const screen =
-            await getScreenSize();
+          const last = lastSentRef.current;
 
-          if (!screen) {
-            return;
+          if (
+            last &&
+            Math.abs(last.x - target.x) < MIN_MOVE_PX &&
+            Math.abs(last.y - target.y) < MIN_MOVE_PX
+          ) {
+            continue;
           }
 
-          const screenX =
-            Math.round(
-              clamp(position.x, 0, 1) *
-                Math.max(
-                  0,
-                  screen.width - 1,
-                ),
-            );
-
-          const screenY =
-            Math.round(
-              clamp(position.y, 0, 1) *
-                Math.max(
-                  0,
-                  screen.height - 1,
-                ),
-            );
+          lastSentRef.current = target;
 
           await invoke<MouseCommandResult>(
             "vision_mouse_move",
             {
-              x: screenX,
-              y: screenY,
+              x: target.x,
+              y: target.y,
             },
           );
-        } catch (error) {
-          console.error(
-            "Failed to move native mouse:",
-            error,
-          );
-
-          if (mountedRef.current) {
-            setMouseStatus(
-              "Native mouse control error",
-            );
-          }
-        } finally {
-          mouseMoveInFlightRef.current = false;
         }
+      } catch (error) {
+        console.error(
+          "Failed to move native mouse:",
+          error,
+        );
+
+        lastSentRef.current = null;
+
+        setStatus("Native mouse control error");
+      } finally {
+        mouseMoveInFlightRef.current = false;
+      }
+    }, [setStatus]);
+
+  /*
+   * Move native OS mouse (normalised camera position -> screen pixels).
+   */
+  const moveNativeMouse =
+    useCallback(
+      (position: { x: number; y: number }) => {
+        if (!tauriAvailableRef.current) {
+          return;
+        }
+
+        const screen = screenSizeRef.current;
+
+        if (!screen) {
+          /* Not resolved yet — shared promise, no extra invoke. */
+          void getScreenSize();
+
+          return;
+        }
+
+        pendingMoveRef.current = {
+          x: Math.round(
+            mapRange(
+              position.x,
+              ACTIVE_X_MIN,
+              ACTIVE_X_MAX,
+            ) * Math.max(0, screen.width - 1),
+          ),
+          y: Math.round(
+            mapRange(
+              position.y,
+              ACTIVE_Y_MIN,
+              ACTIVE_Y_MAX,
+            ) * Math.max(0, screen.height - 1),
+          ),
+        };
+
+        void flushMouseMove();
       },
-      [getScreenSize],
+      [flushMouseMove, getScreenSize],
     );
 
   /*
@@ -559,25 +761,22 @@ export default function VisionPanel({
           "vision_mouse_click",
         );
 
-        if (mountedRef.current) {
-          setMouseStatus("Left click");
-        }
+        setStatus("Left click");
       } catch (error) {
         console.error(
           "Failed to click native mouse:",
           error,
         );
 
-        if (mountedRef.current) {
-          setMouseStatus(
-            "Native mouse click error",
-          );
-        }
+        setStatus("Native mouse click error");
       }
-    }, []);
+    }, [setStatus]);
 
   /*
    * Handle MediaPipe result.
+   *
+   * Stable identity (reads state through refs) so the controller
+   * never sees a changing callback.
    */
   const handleVisionResult =
     useCallback(
@@ -586,122 +785,164 @@ export default function VisionPanel({
           return;
         }
 
-        setProcessing(true);
-
+        /* Always show tracking feedback. */
         setGesture(result.gesture);
-
-        setGestureConfidence(
-          result.confidence,
-        );
-
+        setGestureConfidence(result.confidence);
         setCursor(result.cursor);
-
         setHands(result.hands);
+        setProcessing(result.hands > 0);
 
         updateFps();
 
         /*
-         * When control is disabled,
-         * we still show tracking results,
-         * but we do NOT control the OS mouse.
+         * Stabilise: a gesture must be seen for a few consecutive
+         * frames before it becomes the "stable" gesture. Losing the
+         * hand is applied immediately (safe direction).
          */
-        if (!controlEnabled) {
-          lastGestureRef.current =
-            result.gesture;
+        const raw = result.cursor
+          ? result.gesture
+          : "NONE";
 
-          setProcessing(false);
+        if (raw === candidateGestureRef.current) {
+          candidateCountRef.current += 1;
+        } else {
+          candidateGestureRef.current = raw;
+          candidateCountRef.current = 1;
+        }
+
+        const needed =
+          raw === "NONE"
+            ? 1
+            : raw === "PINCH"
+            ? PINCH_STABLE_FRAMES
+            : STABLE_FRAMES;
+
+        const previousStable =
+          stableGestureRef.current;
+
+        if (candidateCountRef.current >= needed) {
+          stableGestureRef.current = raw;
+        }
+
+        const stable = stableGestureRef.current;
+
+        /*
+         * Hands-free OFF: show tracking only, never touch the OS mouse.
+         */
+        if (!controlEnabledRef.current) {
+          palmStartRef.current = null;
+          palmLatchedRef.current = false;
 
           return;
         }
 
         /*
-         * No hand.
+         * Open palm held = pause / resume.
+         * Latched so one hold toggles exactly once.
          */
-        if (
-          result.gesture === "NONE" ||
-          !result.cursor
-        ) {
-          setMouseStatus(
+        const now = performance.now();
+
+        if (stable === "OPEN_PALM") {
+          if (palmStartRef.current === null) {
+            palmStartRef.current = now;
+          }
+
+          if (
+            !palmLatchedRef.current &&
+            now - palmStartRef.current >= PALM_HOLD_MS
+          ) {
+            palmLatchedRef.current = true;
+
+            const next = !pausedRef.current;
+
+            pausedRef.current = next;
+
+            pendingMoveRef.current = null;
+
+            setPaused(next);
+          }
+        } else {
+          palmStartRef.current = null;
+          palmLatchedRef.current = false;
+        }
+
+        if (pausedRef.current) {
+          setStatus(
+            "Paused — hold open palm to resume",
+          );
+
+          return;
+        }
+
+        if (!tauriAvailableRef.current) {
+          setStatus(
+            "Preview mode — open AIOS desktop app for mouse control",
+          );
+
+          return;
+        }
+
+        if (stable === "NONE") {
+          setStatus(
             "Control enabled — show your hand",
           );
 
-          lastGestureRef.current =
-            result.gesture;
+          return;
+        }
 
-          setProcessing(false);
+        if (stable === "OPEN_PALM") {
+          setStatus(
+            "Open palm — keep holding to pause",
+          );
 
           return;
         }
 
         /*
-         * POINT and PINCH both keep
-         * the OS cursor under the index finger.
+         * POINT -> move native mouse.
+         * Frozen while thumb/index approach each other (pre-click).
          */
-        if (
-          result.gesture === "POINT" ||
-          result.gesture === "PINCH"
-        ) {
-          void moveNativeMouse(
-            result.cursor,
-          );
-
+        if (stable === "POINT") {
           if (
-            result.gesture === "POINT"
+            result.gesture === "POINT" &&
+            result.cursor &&
+            (result.pinchDistance === undefined ||
+              result.pinchDistance >
+                PINCH_FREEZE_DISTANCE)
           ) {
-            setMouseStatus(
-              "Cursor control active",
-            );
+            moveNativeMouse(result.cursor);
           }
+
+          setStatus("Cursor control active");
+
+          return;
         }
 
         /*
-         * PINCH transition:
-         *
-         * POINT -> PINCH
-         *
-         * produces one click only.
+         * PINCH -> one left click per pinch (POINT -> PINCH edge).
          */
-        if (
-          result.gesture === "PINCH" &&
-          lastGestureRef.current !==
-            "PINCH"
-        ) {
-          void clickNativeMouse();
+        if (stable === "PINCH") {
+          if (previousStable !== "PINCH") {
+            void clickNativeMouse();
+          }
+
+          return;
         }
 
-        /*
-         * Open palm = safe pause.
-         */
-        if (
-          result.gesture === "OPEN_PALM"
-        ) {
-          setMouseStatus(
-            "Open palm — control paused",
-          );
+        if (stable === "CLOSED_FIST") {
+          setStatus("Fist detected — control idle");
+
+          return;
         }
 
-        /*
-         * Fist currently has no
-         * destructive action.
-         */
-        if (
-          result.gesture ===
-          "CLOSED_FIST"
-        ) {
-          setMouseStatus(
-            "Fist detected — control paused",
-          );
-        }
-
-        lastGestureRef.current =
-          result.gesture;
-
-        setProcessing(false);
+        setStatus(
+          "Control enabled — point with your index finger",
+        );
       },
       [
         clickNativeMouse,
-        controlEnabled,
         moveNativeMouse,
+        setStatus,
         updateFps,
       ],
     );
@@ -715,33 +956,58 @@ export default function VisionPanel({
         return;
       }
 
-      setControlEnabled((current) => {
-        const next = !current;
+      const next = !controlEnabledRef.current;
 
-        lastGestureRef.current =
-          "NONE";
+      controlEnabledRef.current = next;
+      pausedRef.current = false;
 
-        lastClickTimeRef.current = 0;
+      resetGestureState();
 
-        if (!next) {
-          setMouseStatus(
-            "Hands-free control disabled",
-          );
-        } else if (
-          !tauriAvailableRef.current
-        ) {
-          setMouseStatus(
-            "Preview mode — open AIOS desktop app for mouse control",
-          );
-        } else {
-          setMouseStatus(
-            "Control enabled — point with your index finger",
-          );
-        }
+      setPaused(false);
+      setControlEnabled(next);
 
-        return next;
-      });
-    }, [cameraActive]);
+      if (!next) {
+        setStatus("Hands-free control disabled");
+      } else if (!tauriAvailableRef.current) {
+        setStatus(
+          "Preview mode — open AIOS desktop app for mouse control",
+        );
+      } else {
+        /* Fresh, single screen-size lookup for this session. */
+        screenSizeRef.current = null;
+        screenSizePromiseRef.current = null;
+
+        void getScreenSize();
+
+        setStatus(
+          "Control enabled — point with your index finger",
+        );
+      }
+    }, [
+      cameraActive,
+      getScreenSize,
+      resetGestureState,
+      setStatus,
+    ]);
+
+  /*
+   * Stable error handler (an inline arrow here used to change on
+   * every render).
+   */
+  const handleTrackingError =
+    useCallback(
+      (error: Error) => {
+        console.error(
+          "Hand tracking error:",
+          error,
+        );
+
+        setStatus(
+          `Hand tracking unavailable: ${error.message}`,
+        );
+      },
+      [setStatus],
+    );
 
   return (
     <section
@@ -759,7 +1025,7 @@ export default function VisionPanel({
           </h2>
 
           <p className="mt-1 text-xs text-[#91a0b8]">
-            Point to move • Pinch to click
+            Point to move • Pinch to click • Open palm to pause
           </p>
         </div>
 
@@ -807,7 +1073,9 @@ export default function VisionPanel({
             }`}
           >
             {controlEnabled
-              ? "Hands-Free ON"
+              ? paused
+                ? "Paused"
+                : "Hands-Free ON"
               : "Control OFF"}
           </span>
         </div>
@@ -834,12 +1102,7 @@ export default function VisionPanel({
             controlEnabled={controlEnabled}
             mirrored
             onResult={handleVisionResult}
-            onError={(error) => {
-              console.error(
-                "Hand tracking error:",
-                error,
-              );
-            }}
+            onError={handleTrackingError}
           />
 
           {/* Camera loading */}
@@ -922,7 +1185,9 @@ export default function VisionPanel({
             showInstructions
             instruction={
               controlEnabled
-                ? "Point with your index finger. Pinch thumb + index to click."
+                ? paused
+                  ? "Control paused. Hold an open palm to resume."
+                  : "Point to move. Pinch thumb + index to click. Hold open palm to pause."
                 : "Enable Hands-Free Control to control the mouse."
             }
           />

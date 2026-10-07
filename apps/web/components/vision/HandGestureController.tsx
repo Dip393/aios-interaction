@@ -1,21 +1,19 @@
 "use client";
 
-import React, {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 import {
   FilesetResolver,
   HandLandmarker,
-  type HandLandmarkerResult,
 } from "@mediapipe/tasks-vision";
 
 export type HandGestureControllerProps = {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   enabled?: boolean;
+  /**
+   * Kept for backwards compatibility.
+   * Gesture -> mouse action mapping lives in VisionPanel.
+   */
   controlEnabled?: boolean;
   mirrored?: boolean;
   onResult?: (result: HandGestureResult) => void;
@@ -47,6 +45,12 @@ export type HandGestureResult = {
     z: number;
   }>;
   timestamp: number;
+  /**
+   * Thumb-tip <-> index-tip distance, normalised by palm size.
+   * Small = pinching. Used by the consumer to freeze the cursor
+   * while the fingers approach each other.
+   */
+  pinchDistance?: number;
 };
 
 type Point = {
@@ -61,154 +65,137 @@ const MODEL_URL =
 const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm";
 
-const DEFAULT_SMOOTHING = 0.28;
+const CURSOR_SMOOTHING = 0.35;
 
-const PINCH_START_DISTANCE = 0.055;
-const PINCH_END_DISTANCE = 0.075;
+/*
+ * Distances below are normalised by palm size
+ * (wrist -> middle finger MCP), so they do not depend on how far
+ * the hand is from the camera.
+ */
+const PINCH_START_RATIO = 0.3;
+const PINCH_END_RATIO = 0.45;
+const FINGER_EXTENDED_RATIO = 1.12;
+const THUMB_EXTENDED_RATIO = 0.6;
 
-const CLICK_COOLDOWN_MS = 450;
-
-const INDEX_TIP = 8;
-const INDEX_PIP = 6;
-const INDEX_MCP = 5;
-
-const MIDDLE_TIP = 12;
-const MIDDLE_PIP = 10;
-
-const RING_TIP = 16;
-const RING_PIP = 14;
-
-const PINKY_TIP = 20;
-const PINKY_PIP = 18;
-
+const WRIST = 0;
 const THUMB_TIP = 4;
-const THUMB_IP = 3;
+const INDEX_MCP = 5;
+const INDEX_PIP = 6;
+const INDEX_TIP = 8;
+const MIDDLE_MCP = 9;
+const MIDDLE_PIP = 10;
+const MIDDLE_TIP = 12;
+const RING_PIP = 14;
+const RING_TIP = 16;
+const PINKY_PIP = 18;
+const PINKY_TIP = 20;
 
 function distance(a: Point, b: Point): number {
-  return Math.sqrt(
-    Math.pow(a.x - b.x, 2) +
-      Math.pow(a.y - b.y, 2) +
-      Math.pow(a.z - b.z, 2),
-  );
+  return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-function isFingerExtended(
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Classify one hand.
+ *
+ * `aspect` (video width / height) converts MediaPipe's per-axis
+ * normalised coordinates into a uniform space so distances are
+ * not stretched on 16:9 frames.
+ *
+ * `pinchActive` enables hysteresis: once pinching, the fingers have
+ * to open past PINCH_END_RATIO before the pinch is released.
+ */
+export function classifyHand(
   landmarks: Point[],
-  tipIndex: number,
-  pipIndex: number,
-): boolean {
-  if (!landmarks[tipIndex] || !landmarks[pipIndex]) {
-    return false;
-  }
-
-  return landmarks[tipIndex].y < landmarks[pipIndex].y;
-}
-
-function isThumbExtended(landmarks: Point[]): boolean {
-  if (!landmarks[THUMB_TIP] || !landmarks[THUMB_IP]) {
-    return false;
-  }
-
-  return Math.abs(landmarks[THUMB_TIP].x - landmarks[THUMB_IP].x) > 0.045;
-}
-
-function detectGesture(landmarks: Point[]): {
+  aspect = 16 / 9,
+  pinchActive = false,
+): {
   gesture: HandGestureName;
   confidence: number;
+  pinchDistance: number;
 } {
   if (landmarks.length < 21) {
     return {
       gesture: "NONE",
       confidence: 0,
+      pinchDistance: Number.POSITIVE_INFINITY,
     };
   }
 
-  const indexExtended = isFingerExtended(
-    landmarks,
-    INDEX_TIP,
-    INDEX_PIP,
-  );
+  const p: Point[] = landmarks.map((l) => ({
+    x: l.x * aspect,
+    y: l.y,
+    z: 0,
+  }));
 
-  const middleExtended = isFingerExtended(
-    landmarks,
-    MIDDLE_TIP,
-    MIDDLE_PIP,
-  );
+  const palm = distance(p[WRIST], p[MIDDLE_MCP]);
 
-  const ringExtended = isFingerExtended(
-    landmarks,
-    RING_TIP,
-    RING_PIP,
-  );
+  if (palm < 1e-4) {
+    return {
+      gesture: "NONE",
+      confidence: 0,
+      pinchDistance: Number.POSITIVE_INFINITY,
+    };
+  }
 
-  const pinkyExtended = isFingerExtended(
-    landmarks,
-    PINKY_TIP,
-    PINKY_PIP,
-  );
+  const extended = (tip: number, pip: number) =>
+    distance(p[WRIST], p[tip]) >
+    distance(p[WRIST], p[pip]) * FINGER_EXTENDED_RATIO;
 
-  const thumbExtended = isThumbExtended(landmarks);
+  const indexExtended = extended(INDEX_TIP, INDEX_PIP);
+  const middleExtended = extended(MIDDLE_TIP, MIDDLE_PIP);
+  const ringExtended = extended(RING_TIP, RING_PIP);
+  const pinkyExtended = extended(PINKY_TIP, PINKY_PIP);
 
-  const pinchDistance = distance(
-    landmarks[THUMB_TIP],
-    landmarks[INDEX_TIP],
-  );
+  const thumbExtended =
+    distance(p[THUMB_TIP], p[INDEX_MCP]) / palm >
+    THUMB_EXTENDED_RATIO;
+
+  const pinchDistance =
+    distance(p[THUMB_TIP], p[INDEX_TIP]) / palm;
 
   /*
-   * PINCH
-   *
-   * Thumb + index finger close together.
+   * A closed fist also brings thumb and index tips together.
+   * A real pinch keeps the index finger at least partly open.
    */
-  if (pinchDistance < PINCH_START_DISTANCE) {
+  const indexNotCurled =
+    distance(p[WRIST], p[INDEX_TIP]) >=
+    distance(p[WRIST], p[INDEX_PIP]);
+
+  const pinching =
+    (pinchDistance < PINCH_START_RATIO ||
+      (pinchActive && pinchDistance < PINCH_END_RATIO)) &&
+    (indexNotCurled || pinchDistance < 0.18);
+
+  if (pinching) {
     return {
       gesture: "PINCH",
-      confidence: Math.min(
-        1,
-        Math.max(
-          0,
-          1 - pinchDistance / PINCH_START_DISTANCE,
-        ),
-      ),
+      confidence: clamp(1 - pinchDistance / PINCH_END_RATIO, 0.5, 1),
+      pinchDistance,
     };
   }
 
-  /*
-   * POINT
-   *
-   * Only index finger extended.
-   */
   if (
     indexExtended &&
     !middleExtended &&
     !ringExtended &&
     !pinkyExtended
   ) {
-    return {
-      gesture: "POINT",
-      confidence: 0.9,
-    };
+    return { gesture: "POINT", confidence: 0.9, pinchDistance };
   }
 
-  /*
-   * PEACE
-   *
-   * Index + middle extended.
-   */
   if (
     indexExtended &&
     middleExtended &&
     !ringExtended &&
     !pinkyExtended
   ) {
-    return {
-      gesture: "PEACE",
-      confidence: 0.9,
-    };
+    return { gesture: "PEACE", confidence: 0.9, pinchDistance };
   }
 
-  /*
-   * OPEN PALM
-   */
   if (
     thumbExtended &&
     indexExtended &&
@@ -216,34 +203,20 @@ function detectGesture(landmarks: Point[]): {
     ringExtended &&
     pinkyExtended
   ) {
-    return {
-      gesture: "OPEN_PALM",
-      confidence: 0.9,
-    };
+    return { gesture: "OPEN_PALM", confidence: 0.9, pinchDistance };
   }
 
-  /*
-   * THUMBS UP
-   *
-   * Thumb extended while other fingers remain folded.
-   */
   if (
     thumbExtended &&
     !indexExtended &&
     !middleExtended &&
     !ringExtended &&
     !pinkyExtended &&
-    landmarks[THUMB_TIP].y < landmarks[THUMB_IP].y
+    p[THUMB_TIP].y < p[INDEX_MCP].y
   ) {
-    return {
-      gesture: "THUMBS_UP",
-      confidence: 0.85,
-    };
+    return { gesture: "THUMBS_UP", confidence: 0.85, pinchDistance };
   }
 
-  /*
-   * CLOSED FIST
-   */
   if (
     !indexExtended &&
     !middleExtended &&
@@ -251,38 +224,15 @@ function detectGesture(landmarks: Point[]): {
     !pinkyExtended &&
     !thumbExtended
   ) {
-    return {
-      gesture: "CLOSED_FIST",
-      confidence: 0.85,
-    };
+    return { gesture: "CLOSED_FIST", confidence: 0.85, pinchDistance };
   }
 
-  return {
-    gesture: "NONE",
-    confidence: 0.4,
-  };
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function smoothValue(
-  previous: number | null,
-  current: number,
-  smoothing: number,
-): number {
-  if (previous === null) {
-    return current;
-  }
-
-  return previous + (current - previous) * smoothing;
+  return { gesture: "NONE", confidence: 0.4, pinchDistance };
 }
 
 export default function HandGestureController({
   videoRef,
   enabled = true,
-  controlEnabled = false,
   mirrored = true,
   onResult,
   onError,
@@ -294,394 +244,255 @@ export default function HandGestureController({
 
   const landmarkerRef = useRef<HandLandmarker | null>(null);
 
-  const animationFrameRef =
-    useRef<number | null>(null);
-
-  const lastVideoTimeRef = useRef(-1);
-
-  const previousCursorRef = useRef<{
-    x: number;
-    y: number;
-  } | null>(null);
-
-  const pinchActiveRef = useRef(false);
-
-  const lastClickTimeRef = useRef(0);
-
-  const mountedRef = useRef(false);
-
-  const initializingRef = useRef(false);
-
-  const processingRef = useRef(false);
-
-  const initialize = useCallback(async () => {
-    if (initializingRef.current) {
-      return;
-    }
-
-    if (landmarkerRef.current) {
-      return;
-    }
-
-    initializingRef.current = true;
-
-    try {
-      setError(null);
-
-      const vision = await FilesetResolver.forVisionTasks(
-        WASM_URL,
-      );
-
-      const landmarker =
-        await HandLandmarker.createFromOptions(
-          vision,
-          {
-            baseOptions: {
-              modelAssetPath: MODEL_URL,
-              delegate: "GPU",
-            },
-
-            runningMode: "VIDEO",
-
-            numHands: 1,
-
-            minHandDetectionConfidence: 0.55,
-
-            minHandPresenceConfidence: 0.55,
-
-            minTrackingConfidence: 0.55,
-          },
-        );
-
-      if (!mountedRef.current) {
-        landmarker.close();
-        return;
-      }
-
-      landmarkerRef.current = landmarker;
-
-      setReady(true);
-    } catch (err) {
-      const normalizedError =
-        err instanceof Error
-          ? err
-          : new Error(String(err));
-
-      setError(normalizedError.message);
-
-      onError?.(normalizedError);
-    } finally {
-      initializingRef.current = false;
-    }
-  }, [onError]);
-
-  const emitResult = useCallback(
-    (
-      gesture: HandGestureName,
-      confidence: number,
-      cursor: {
-        x: number;
-        y: number;
-      } | null,
-      landmarks: Point[],
-      hands: number,
-    ) => {
-      onResult?.({
-        gesture,
-        confidence,
-        cursor,
-        hands,
-        landmarks,
-        timestamp: performance.now(),
-      });
-    },
-    [onResult],
-  );
-
-  const processVideo = useCallback(() => {
-    if (!mountedRef.current) {
-      return;
-    }
-
-    const video = videoRef.current;
-
-    const landmarker = landmarkerRef.current;
-
-    if (
-      !enabled ||
-      !video ||
-      !landmarker ||
-      video.readyState < 2 ||
-      video.videoWidth === 0 ||
-      video.videoHeight === 0
-    ) {
-      animationFrameRef.current =
-        requestAnimationFrame(processVideo);
-
-      return;
-    }
-
-    /*
-     * MediaPipe should not receive the exact same video frame
-     * repeatedly.
-     */
-    if (
-      video.currentTime === lastVideoTimeRef.current
-    ) {
-      animationFrameRef.current =
-        requestAnimationFrame(processVideo);
-
-      return;
-    }
-
-    if (processingRef.current) {
-      animationFrameRef.current =
-        requestAnimationFrame(processVideo);
-
-      return;
-    }
-
-    processingRef.current = true;
-
-    try {
-      const timestamp = performance.now();
-
-      const result: HandLandmarkerResult =
-        landmarker.detectForVideo(
-          video,
-          timestamp,
-        );
-
-      lastVideoTimeRef.current =
-        video.currentTime;
-
-      const firstHand =
-        result.landmarks?.[0];
-
-      if (!firstHand || firstHand.length < 21) {
-        setTracking(false);
-
-        previousCursorRef.current = null;
-
-        /*
-         * Losing the hand automatically releases pinch.
-         * This prevents a stuck click/drag state.
-         */
-        pinchActiveRef.current = false;
-
-        emitResult(
-          "NONE",
-          0,
-          null,
-          [],
-          result.landmarks?.length ?? 0,
-        );
-
-        return;
-      }
-
-      setTracking(true);
-
-      const landmarks: Point[] =
-        firstHand.map((landmark) => ({
-          x: landmark.x,
-          y: landmark.y,
-          z: landmark.z,
-        }));
-
-      const detected =
-        detectGesture(landmarks);
-
-      /*
-       * Index finger tip is used as virtual cursor.
-       */
-      let cursorX = landmarks[INDEX_TIP].x;
-      let cursorY = landmarks[INDEX_TIP].y;
-
-      /*
-       * User-facing mirrored preview:
-       *
-       * Camera image is mirrored horizontally,
-       * therefore the logical screen cursor is
-       * horizontally inverted as well.
-       */
-      if (mirrored) {
-        cursorX = 1 - cursorX;
-      }
-
-      cursorX = clamp(cursorX, 0, 1);
-      cursorY = clamp(cursorY, 0, 1);
-
-      const previous =
-        previousCursorRef.current;
-
-      const smoothedX = smoothValue(
-        previous?.x ?? null,
-        cursorX,
-        DEFAULT_SMOOTHING,
-      );
-
-      const smoothedY = smoothValue(
-        previous?.y ?? null,
-        cursorY,
-        DEFAULT_SMOOTHING,
-      );
-
-      previousCursorRef.current = {
-        x: smoothedX,
-        y: smoothedY,
-      };
-
-      const normalizedCursor = {
-        x: smoothedX,
-        y: smoothedY,
-      };
-
-      /*
-       * The controller only reports gestures.
-       *
-       * Native OS mouse movement/clicking will be connected
-       * separately through Tauri.
-       */
-      if (controlEnabled) {
-        const now = Date.now();
-
-        if (
-          detected.gesture === "PINCH" &&
-          !pinchActiveRef.current &&
-          now - lastClickTimeRef.current >=
-            CLICK_COOLDOWN_MS
-        ) {
-          pinchActiveRef.current = true;
-
-          lastClickTimeRef.current = now;
-        }
-
-        if (
-          detected.gesture !== "PINCH" &&
-          pinchActiveRef.current
-        ) {
-          /*
-           * Hysteresis:
-           *
-           * PINCH_END_DISTANCE is intentionally larger
-           * than PINCH_START_DISTANCE.
-           *
-           * This makes the pinch state less sensitive
-           * to tiny hand movements.
-           */
-          const currentPinchDistance =
-            distance(
-              landmarks[THUMB_TIP],
-              landmarks[INDEX_TIP],
-            );
-
-          if (
-            currentPinchDistance >
-            PINCH_END_DISTANCE
-          ) {
-            pinchActiveRef.current = false;
-          }
-        }
-      } else {
-        pinchActiveRef.current = false;
-      }
-
-      emitResult(
-        detected.gesture,
-        detected.confidence,
-        normalizedCursor,
-        landmarks,
-        result.landmarks?.length ?? 0,
-      );
-    } catch (err) {
-      const normalizedError =
-        err instanceof Error
-          ? err
-          : new Error(String(err));
-
-      setError(normalizedError.message);
-
-      onError?.(normalizedError);
-    } finally {
-      processingRef.current = false;
-    }
-
-    animationFrameRef.current =
-      requestAnimationFrame(processVideo);
-  }, [
-    controlEnabled,
-    emitResult,
-    enabled,
-    mirrored,
-    onError,
-    videoRef,
-  ]);
+  /*
+   * Callbacks/props live in refs so that parent re-renders
+   * (which happen on every gesture result) never tear down
+   * the MediaPipe model or restart the detection loop.
+   */
+  const onResultRef = useRef(onResult);
+  const onErrorRef = useRef(onError);
+  const mirroredRef = useRef(mirrored);
 
   useEffect(() => {
-    mountedRef.current = true;
+    onResultRef.current = onResult;
+    onErrorRef.current = onError;
+    mirroredRef.current = mirrored;
+  });
 
-    void initialize();
+  /*
+   * Create the landmarker exactly once.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    let created: HandLandmarker | null = null;
+
+    const create = async () => {
+      try {
+        setError(null);
+
+        const fileset =
+          await FilesetResolver.forVisionTasks(WASM_URL);
+
+        const buildOptions = (delegate: "GPU" | "CPU") => ({
+          baseOptions: {
+            modelAssetPath: MODEL_URL,
+            delegate,
+          },
+          runningMode: "VIDEO" as const,
+          numHands: 1,
+          minHandDetectionConfidence: 0.55,
+          minHandPresenceConfidence: 0.55,
+          minTrackingConfidence: 0.55,
+        });
+
+        let landmarker: HandLandmarker;
+
+        try {
+          landmarker = await HandLandmarker.createFromOptions(
+            fileset,
+            buildOptions("GPU"),
+          );
+        } catch {
+          /* GPU delegate is not available everywhere (e.g. some WebViews). */
+          landmarker = await HandLandmarker.createFromOptions(
+            fileset,
+            buildOptions("CPU"),
+          );
+        }
+
+        if (cancelled) {
+          landmarker.close();
+          return;
+        }
+
+        created = landmarker;
+        landmarkerRef.current = landmarker;
+        setReady(true);
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+
+        const normalized =
+          err instanceof Error ? err : new Error(String(err));
+
+        setError(normalized.message);
+        onErrorRef.current?.(normalized);
+      }
+    };
+
+    void create();
 
     return () => {
-      mountedRef.current = false;
-
-      if (
-        animationFrameRef.current !== null
-      ) {
-        cancelAnimationFrame(
-          animationFrameRef.current,
-        );
-
-        animationFrameRef.current = null;
-      }
-
-      landmarkerRef.current?.close();
+      cancelled = true;
 
       landmarkerRef.current = null;
 
-      previousCursorRef.current = null;
-
-      pinchActiveRef.current = false;
-    };
-  }, [initialize]);
-
-  useEffect(() => {
-    if (!enabled || !ready) {
-      if (
-        animationFrameRef.current !== null
-      ) {
-        cancelAnimationFrame(
-          animationFrameRef.current,
-        );
-
-        animationFrameRef.current = null;
+      try {
+        created?.close();
+      } catch {
+        /* already closed */
       }
 
+      setReady(false);
+    };
+  }, []);
+
+  /*
+   * Detection loop.
+   *
+   * One loop per (enabled, ready) change. The next frame is ALWAYS
+   * scheduled from `finally`, so "no hand", errors or early exits
+   * can never stop the loop.
+   */
+  useEffect(() => {
+    if (!enabled || !ready) {
       return;
     }
 
-    if (animationFrameRef.current === null) {
-      animationFrameRef.current =
-        requestAnimationFrame(processVideo);
-    }
+    let active = true;
+    let rafId = 0;
 
-    return () => {
-      if (
-        animationFrameRef.current !== null
-      ) {
-        cancelAnimationFrame(
-          animationFrameRef.current,
-        );
+    let lastVideoTime = -1;
+    let lastTimestamp = 0;
+    let smoothed: { x: number; y: number } | null = null;
+    let pinchActive = false;
+    let wasTracking = false;
+    let lastErrorMessage = "";
 
-        animationFrameRef.current = null;
+    const emit = (result: HandGestureResult) => {
+      onResultRef.current?.(result);
+    };
+
+    const tick = () => {
+      if (!active) {
+        return;
+      }
+
+      try {
+        const video = videoRef.current;
+        const landmarker = landmarkerRef.current;
+
+        if (
+          video &&
+          landmarker &&
+          video.readyState >= 2 &&
+          video.videoWidth > 0 &&
+          video.videoHeight > 0 &&
+          video.currentTime !== lastVideoTime
+        ) {
+          lastVideoTime = video.currentTime;
+
+          const now = performance.now();
+          const timestamp =
+            now > lastTimestamp ? now : lastTimestamp + 1;
+          lastTimestamp = timestamp;
+
+          const result = landmarker.detectForVideo(
+            video,
+            timestamp,
+          );
+
+          const handCount = result.landmarks?.length ?? 0;
+          const hand = result.landmarks?.[0];
+
+          if (!hand || hand.length < 21) {
+            if (wasTracking) {
+              wasTracking = false;
+              setTracking(false);
+            }
+
+            smoothed = null;
+            pinchActive = false;
+
+            emit({
+              gesture: "NONE",
+              confidence: 0,
+              cursor: null,
+              hands: handCount,
+              landmarks: [],
+              timestamp: now,
+            });
+          } else {
+            if (!wasTracking) {
+              wasTracking = true;
+              setTracking(true);
+            }
+
+            const landmarks: Point[] = hand.map((l) => ({
+              x: l.x,
+              y: l.y,
+              z: l.z,
+            }));
+
+            const detected = classifyHand(
+              landmarks,
+              video.videoWidth / video.videoHeight,
+              pinchActive,
+            );
+
+            pinchActive = detected.gesture === "PINCH";
+
+            /* Index fingertip is the virtual cursor. */
+            let cursorX = landmarks[INDEX_TIP].x;
+            const cursorY = landmarks[INDEX_TIP].y;
+
+            /* Preview is mirrored, so the logical X is inverted. */
+            if (mirroredRef.current) {
+              cursorX = 1 - cursorX;
+            }
+
+            cursorX = clamp(cursorX, 0, 1);
+
+            const targetY = clamp(cursorY, 0, 1);
+
+            smoothed = smoothed
+              ? {
+                  x:
+                    smoothed.x +
+                    (cursorX - smoothed.x) * CURSOR_SMOOTHING,
+                  y:
+                    smoothed.y +
+                    (targetY - smoothed.y) * CURSOR_SMOOTHING,
+                }
+              : { x: cursorX, y: targetY };
+
+            emit({
+              gesture: detected.gesture,
+              confidence: detected.confidence,
+              cursor: { x: smoothed.x, y: smoothed.y },
+              hands: handCount,
+              landmarks,
+              timestamp: now,
+              pinchDistance: detected.pinchDistance,
+            });
+          }
+        }
+      } catch (err) {
+        const normalized =
+          err instanceof Error ? err : new Error(String(err));
+
+        /* Report each distinct error once, not once per frame. */
+        if (normalized.message !== lastErrorMessage) {
+          lastErrorMessage = normalized.message;
+          setError(normalized.message);
+          onErrorRef.current?.(normalized);
+        }
+      } finally {
+        if (active) {
+          rafId = requestAnimationFrame(tick);
+        }
       }
     };
-  }, [
-    enabled,
-    ready,
-    processVideo,
-  ]);
+
+    rafId = requestAnimationFrame(tick);
+
+    return () => {
+      active = false;
+      cancelAnimationFrame(rafId);
+      setTracking(false);
+    };
+  }, [enabled, ready, videoRef]);
 
   return (
     <div

@@ -35,10 +35,40 @@ export class ApiError extends Error {
   }
 }
 
-const DEFAULT_API_BASE_URL =
+/**
+ * Backend origin (WITHOUT the /api prefix).
+ *
+ * The FastAPI backend mounts every router under /api (see apps/api/main.py),
+ * so the /api prefix is added exactly once, in buildUrl() below.
+ *
+ * NEXT_PUBLIC_API_URL may be set either to the origin
+ * (http://127.0.0.1:8000) or to the origin + /api
+ * (http://127.0.0.1:8000/api) - both resolve to the same final URLs.
+ * Set it to an empty string to use the same origin as the page
+ * (e.g. behind a reverse proxy).
+ */
+const DEFAULT_API_ORIGIN = "http://127.0.0.1:8000";
+
+const API_PREFIX = "/api";
+
+const API_ORIGIN = (
   process.env.NEXT_PUBLIC_API_URL ??
   process.env.NEXT_PUBLIC_API_BASE_URL ??
-  "/api";
+  DEFAULT_API_ORIGIN
+)
+  .trim()
+  .replace(/\/+$/, "")
+  .replace(/\/api$/i, "");
+
+/**
+ * Remove a leading /api segment so callers may pass either
+ * "/tasks" or "/api/tasks" and still get a single /api.
+ */
+function stripApiPrefix(path: string): string {
+  const withSlash = path.startsWith("/") ? path : `/${path}`;
+
+  return withSlash.replace(/^\/api(?=\/|\?|$)/i, "") || "/";
+}
 
 /**
  * Build the final API URL.
@@ -47,13 +77,7 @@ function buildUrl(
   path: string,
   query?: ApiRequestOptions["query"]
 ): string {
-  const base = DEFAULT_API_BASE_URL.replace(/\/+$/, "");
-
-  const normalizedPath = path.startsWith("/")
-    ? path
-    : `/${path}`;
-
-  const url = `${base}${normalizedPath}`;
+  const url = `${API_ORIGIN}${API_PREFIX}${stripApiPrefix(path)}`;
 
   if (!query) {
     return url;
